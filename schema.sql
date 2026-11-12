@@ -167,6 +167,13 @@ DROP INDEX IF EXISTS idx_views_camp_id; CREATE INDEX idx_views_camp_id ON campai
 DROP INDEX IF EXISTS idx_views_subscriber_id; CREATE INDEX idx_views_subscriber_id ON campaign_views(subscriber_id);
 DROP INDEX IF EXISTS idx_views_date; CREATE INDEX idx_views_date ON campaign_views(created_at);
 
+-- Tracking edge sync cursor. Last event sequence number processed per edge instance.
+CREATE TABLE IF NOT EXISTS edge_sync_state (
+    edge_id          TEXT PRIMARY KEY,
+    last_seq         BIGINT NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- media
 DROP TABLE IF EXISTS media CASCADE;
 CREATE TABLE media (

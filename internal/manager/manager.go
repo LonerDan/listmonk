@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"maps"
@@ -102,6 +103,13 @@ type Manager struct {
 	// be locked as it may be used externally when previewing campaigns.
 	links    map[string]string
 	linksMut sync.RWMutex
+
+	// linkSync, if set, registers a newly created tracked link with the tracking edge.
+	linkSync func(uuid, url string) error
+
+	// edgeBackoffUntil (unix nanos) skips edge link syncs after a failure, so that
+	// sends fall back to original URLs instead of stalling on an unreachable edge.
+	edgeBackoffUntil atomic.Int64
 
 	nextPipes chan *pipe
 	campMsgQ  chan CampaignMessage
@@ -628,6 +636,15 @@ func (m *Manager) nextCampaigns() ([]*models.Campaign, error) {
 	return m.store.NextCampaigns(ids, counts, lastIDs)
 }
 
+// edgeBackoff is how long link syncs to the tracking edge are skipped after a failure.
+const edgeBackoff = 30 * time.Second
+
+// SetLinkSync sets a function that registers newly created tracked links with
+// a tracking edge. Must be set before the manager starts sending.
+func (m *Manager) SetLinkSync(fn func(uuid, url string) error) {
+	m.linkSync = fn
+}
+
 // trackLink register a URL and return its UUID to be used in message templates
 // for tracking links.
 func (m *Manager) trackLink(url, campUUID, subUUID string) string {
@@ -644,6 +661,11 @@ func (m *Manager) trackLink(url, campUUID, subUUID string) string {
 	}
 	m.linksMut.RUnlock()
 
+	// If the tracking edge recently failed, use the original URL for now.
+	if time.Now().UnixNano() < m.edgeBackoffUntil.Load() {
+		return url
+	}
+
 	// Register link.
 	uu, err := m.store.CreateLink(url)
 	if err != nil {
@@ -651,6 +673,16 @@ func (m *Manager) trackLink(url, campUUID, subUUID string) string {
 
 		// If the registration fails, fail over to the original URL.
 		return url
+	}
+
+	// Register the link with the tracking edge before it's used in a message,
+	// so that clicks on it are not lost. Not cached on failure, so it's retried.
+	if m.linkSync != nil {
+		if err := m.linkSync(uu, url); err != nil {
+			m.log.Printf("error syncing tracked link '%s' to edge: %v", url, err)
+			m.edgeBackoffUntil.Store(time.Now().Add(edgeBackoff).UnixNano())
+			return url
+		}
 	}
 
 	m.linksMut.Lock()

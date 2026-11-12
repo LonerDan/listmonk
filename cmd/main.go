@@ -251,6 +251,12 @@ func main() {
 		}
 	}
 
+	// If the tracking edge is enabled, tracked links are registered with it before use.
+	edgeCl := initEdgeClient(ko)
+	if edgeCl != nil {
+		mgr.SetLinkSync(edgeCl.PutLink)
+	}
+
 	// Initialize the global admin/sub e-mail notifier.
 	initNotifs(fs, i18n, emailMsgr, urlCfg, ko)
 
@@ -269,6 +275,11 @@ func main() {
 	// Start the campaign manager workers. The campaign batches (fetch from DB, push out
 	// messages) get processed at the specified interval.
 	go mgr.Run()
+
+	// Pull tracking events from the edge, if enabled.
+	if edgeCl != nil {
+		go initEdgeSync(edgeCl, db, queries, ko).Run()
+	}
 
 	// =========================================================================
 	// Initialize the App{} with all the global shared components, controllers and fields.

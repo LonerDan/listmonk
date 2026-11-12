@@ -495,6 +495,12 @@ func initSettings(query string, db *sqlx.DB, ko *koanf.Koanf) {
 func initUrlConfig(ko *koanf.Koanf) *UrlConfig {
 	root := strings.TrimSuffix(ko.String("app.root_url"), "/")
 
+	// Tracking links and pixels are served from the tracking edge if enabled.
+	trackRoot := root
+	if ko.Bool("tracking_edge.enabled") {
+		trackRoot = strings.TrimSuffix(ko.String("tracking_edge.public_url"), "/")
+	}
+
 	// rootPath is the path component of the root URL set in config.
 	// It's used as the base path for all admin/static asset URLs.
 	var rootPath string
@@ -517,7 +523,7 @@ func initUrlConfig(ko *koanf.Koanf) *UrlConfig {
 		OptinURL: fmt.Sprintf("%s/subscription/optin/%%s?%%s", root),
 
 		// url.com/link/{campaign_uuid}/{subscriber_uuid}/{link_uuid}
-		LinkTrackURL: fmt.Sprintf("%s/link/%%s/%%s/%%s", root),
+		LinkTrackURL: fmt.Sprintf("%s/link/%%s/%%s/%%s", trackRoot),
 
 		// url.com/link/{campaign_uuid}/{subscriber_uuid}
 		MessageURL: fmt.Sprintf("%s/campaign/%%s/%%s", root),
@@ -526,7 +532,7 @@ func initUrlConfig(ko *koanf.Koanf) *UrlConfig {
 		ArchiveURL: root + "/archive",
 
 		// url.com/campaign/{campaign_uuid}/{subscriber_uuid}/px.png
-		ViewTrackURL: fmt.Sprintf("%s/campaign/%%s/%%s/px.png", root),
+		ViewTrackURL: fmt.Sprintf("%s/campaign/%%s/%%s/px.png", trackRoot),
 	}
 }
 

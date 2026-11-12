@@ -22,3 +22,22 @@ max_lifetime = "300s"
 
 # Optional space separated Postgres DSN params. eg: "application_name=listmonk gssencmode=disable"
 params = ""
+
+# Optional tracking edge. When enabled, campaign view and link click tracking is
+# served by a separate public-facing edge instance, which relays events back here.
+# The main instance only makes outbound connections to the edge's internal API
+# (over a VPN); it does not need any inbound ports for this.
+[tracking_edge]
+enabled = false
+
+# Public base URL of the edge, used in tracking links and pixels.
+public_url = ""
+
+# Internal base URL of the edge's VPN-only API. eg: "http://10.8.0.2:9100"
+internal_url = ""
+
+# Bearer token shared with the edge's internal API.
+token = ""
+
+# How often to pull events from the edge.
+poll_interval = "30s"

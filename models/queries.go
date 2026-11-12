@@ -124,6 +124,11 @@ type Queries struct {
 	GetLinkURL        *sqlx.Stmt `query:"get-link-url"`
 	RegisterLinkClick *sqlx.Stmt `query:"register-link-click"`
 
+	EdgeInsertView   *sqlx.Stmt `query:"edge-insert-view"`
+	EdgeInsertClick  *sqlx.Stmt `query:"edge-insert-click"`
+	EdgeGetSyncState *sqlx.Stmt `query:"edge-get-sync-state"`
+	EdgeSetSyncState *sqlx.Stmt `query:"edge-set-sync-state"`
+
 	GetSettings         *sqlx.Stmt `query:"get-settings"`
 	UpdateSettings      *sqlx.Stmt `query:"update-settings"`
 	UpdateSettingsByKey *sqlx.Stmt `query:"update-settings-by-key"`

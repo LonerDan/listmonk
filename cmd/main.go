@@ -277,8 +277,9 @@ func main() {
 	go mgr.Run()
 
 	// Pull tracking events from the edge, if enabled.
+	edgeCtx, edgeCancel := context.WithCancel(context.Background())
 	if edgeCl != nil {
-		go initEdgeSync(edgeCl, db, queries, ko).Run()
+		go initEdgeSync(edgeCl, db, queries, ko).Run(edgeCtx)
 	}
 
 	// =========================================================================
@@ -346,6 +347,9 @@ func main() {
 
 		// Close the campaign manager.
 		mgr.Close()
+
+		// Stop the tracking edge sync loop.
+		edgeCancel()
 
 		// Close the DB pool.
 		db.Close()

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/jmoiron/sqlx"
+	"github.com/jmoiron/sqlx/types"
 	"github.com/knadh/koanf/v2"
 	"github.com/knadh/listmonk/internal/edge"
 	"github.com/knadh/listmonk/models"
@@ -38,12 +42,18 @@ func initEdgeClient(ko *koanf.Koanf) *edge.Client {
 // edgeSync pulls tracking events from the edge and records them in the database.
 // The main instance only makes outbound connections to the edge.
 type edgeSync struct {
-	client     *edge.Client
-	db         *sqlx.DB
-	q          *models.Queries
-	interval   time.Duration
-	disable    bool
-	individual bool
+	client   *edge.Client
+	db       *sqlx.DB
+	q        *models.Queries
+	interval time.Duration
+
+	// lastEdgeID is the edge ID seen in the last successful sync cycle. If it
+	// changes (eg: the edge's database was wiped or replaced), sync is halted
+	// and a prominent alert is logged, as events would otherwise be re-read
+	// from seq 0 and duplicated.
+	lastEdgeID string
+
+	mu sync.Mutex
 }
 
 func initEdgeSync(client *edge.Client, db *sqlx.DB, q *models.Queries, ko *koanf.Koanf) *edgeSync {
@@ -53,30 +63,61 @@ func initEdgeSync(client *edge.Client, db *sqlx.DB, q *models.Queries, ko *koanf
 	}
 
 	return &edgeSync{
-		client:     client,
-		db:         db,
-		q:          q,
-		interval:   interval,
-		disable:    ko.Bool("privacy.disable_tracking"),
-		individual: ko.Bool("privacy.individual_tracking"),
+		client:   client,
+		db:       db,
+		q:        q,
+		interval: interval,
 	}
 }
 
-// Run polls the edge at the configured interval. It never returns.
-func (e *edgeSync) Run() {
+// Run polls the edge at the configured interval until ctx is cancelled.
+func (e *edgeSync) Run(ctx context.Context) {
 	for {
 		if err := e.sync(); err != nil {
 			lo.Printf("error syncing tracking edge: %v", err)
 		}
-		time.Sleep(e.interval)
+
+		select {
+		case <-ctx.Done():
+			lo.Println("stopping tracking edge sync")
+			return
+		case <-time.After(e.interval):
+		}
 	}
+}
+
+// checkEdgeID halts syncing if the edge's ID has changed since the last cycle.
+// A changed edge ID means events may be re-read from seq 0, which is never
+// something that should happen silently.
+func (e *edgeSync) checkEdgeID(id string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.lastEdgeID == "" {
+		e.lastEdgeID = id
+		return nil
+	}
+	if e.lastEdgeID != id {
+		return fmt.Errorf("TRACKING EDGE ID CHANGED from %s to %s. This usually means the edge's "+
+			"data store was wiped or replaced. Syncing is halted to avoid re-reading and "+
+			"duplicating events from seq 0. Restore the previous edge ID or reset the "+
+			"edge_sync_state row for the new edge manually", e.lastEdgeID, id)
+	}
+	return nil
 }
 
 // sync pushes the tracking config, then drains all pending events from the edge.
 func (e *edgeSync) sync() error {
+	// Read the tracking settings from the DB on every cycle so that changes
+	// made from the admin UI are reflected without a restart.
+	disable, individual, err := e.getTrackingSettings()
+	if err != nil {
+		return fmt.Errorf("reading tracking settings: %w", err)
+	}
+
 	if err := e.client.PutConfig(edge.Config{
-		DisableTracking:    e.disable,
-		IndividualTracking: e.individual,
+		DisableTracking:    disable,
+		IndividualTracking: individual,
 	}); err != nil {
 		return fmt.Errorf("pushing config: %w", err)
 	}
@@ -84,6 +125,16 @@ func (e *edgeSync) sync() error {
 	h, err := e.client.Health()
 	if err != nil {
 		return fmt.Errorf("fetching health: %w", err)
+	}
+
+	if err := e.checkEdgeID(h.EdgeID); err != nil {
+		// Prominently flag the change: this is a data-integrity condition, not
+		// a transient failure. The error is returned (and logged by Run) on
+		// every cycle until it is resolved.
+		lo.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"+
+			"%v\n"+
+			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", err)
+		return err
 	}
 
 	var last int64
@@ -103,7 +154,7 @@ func (e *edgeSync) sync() error {
 			return nil
 		}
 
-		newLast, err := e.record(batch.EdgeID, last, batch.Events)
+		newLast, err := e.record(batch.EdgeID, last, batch.Events, individual)
 		if err != nil {
 			return err
 		}
@@ -120,10 +171,35 @@ func (e *edgeSync) sync() error {
 	}
 }
 
+// getTrackingSettings reads privacy.disable_tracking and privacy.individual_tracking
+// from the settings table, so that admin UI changes take effect without a restart.
+func (e *edgeSync) getTrackingSettings() (disable, individual bool, err error) {
+	var s types.JSONText
+	if err := e.q.GetSettings.Get(&s); err != nil {
+		return false, false, err
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(s, &out); err != nil {
+		return false, false, err
+	}
+
+	parse := func(key string) bool {
+		switch v := out[key].(type) {
+		case bool:
+			return v
+		case string:
+			return v == "true" || v == "t" || v == "1"
+		}
+		return false
+	}
+	return parse("privacy.disable_tracking"), parse("privacy.individual_tracking"), nil
+}
+
 // record inserts a batch of events and advances the sync cursor in a single
 // transaction. Events with a sequence number at or below last were already
 // processed and are skipped. It returns the new cursor value.
-func (e *edgeSync) record(edgeID string, last int64, events []edge.Event) (int64, error) {
+func (e *edgeSync) record(edgeID string, last int64, events []edge.Event, individual bool) (int64, error) {
 	tx, err := e.db.Beginx()
 	if err != nil {
 		return 0, err
@@ -139,7 +215,7 @@ func (e *edgeSync) record(edgeID string, last int64, events []edge.Event) (int64
 			newLast = ev.Seq
 		}
 
-		if err := e.recordEvent(tx, ev); err != nil {
+		if err := e.recordEvent(tx, ev, individual); err != nil {
 			return 0, fmt.Errorf("recording event %d: %w", ev.Seq, err)
 		}
 	}
@@ -158,7 +234,7 @@ func (e *edgeSync) record(edgeID string, last int64, events []edge.Event) (int64
 
 // recordEvent writes a single view or click. Malformed events are logged and skipped
 // so that they don't block the sync cursor.
-func (e *edgeSync) recordEvent(tx *sqlx.Tx, ev edge.Event) error {
+func (e *edgeSync) recordEvent(tx *sqlx.Tx, ev edge.Event, individual bool) error {
 	if !validUUID(ev.CampUUID) || (ev.SubUUID != "" && !validUUID(ev.SubUUID)) {
 		lo.Printf("skipping tracking edge event %d: invalid campaign or subscriber UUID", ev.Seq)
 		return nil
@@ -172,7 +248,7 @@ func (e *edgeSync) recordEvent(tx *sqlx.Tx, ev edge.Event) error {
 	// Mirror the main instance's handling of the dummy UUIDs used by template previews
 	// and by individual tracking being disabled.
 	sub := ev.SubUUID
-	if !e.individual || sub == dummyUUID {
+	if !individual || sub == dummyUUID {
 		sub = ""
 	}
 

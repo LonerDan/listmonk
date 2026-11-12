@@ -683,6 +683,9 @@ func (m *Manager) trackLink(url, campUUID, subUUID string) string {
 			m.edgeBackoffUntil.Store(time.Now().Add(edgeBackoff).UnixNano())
 			return url
 		}
+
+		// The edge is reachable again; clear any backoff from earlier failures.
+		m.edgeBackoffUntil.Store(0)
 	}
 
 	m.linksMut.Lock()

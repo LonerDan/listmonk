@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +26,12 @@ func TestEdgeSync(t *testing.T) {
 	dsn := os.Getenv("LISTMONK_TEST_DSN")
 	if dsn == "" {
 		t.Skip("LISTMONK_TEST_DSN not set")
+	}
+
+	// resetSchema drops the public schema. Refuse DSNs that don't look like a
+	// disposable test database to avoid nuking a real instance.
+	if !strings.Contains(strings.ToLower(dsn), "test") {
+		t.Fatalf("refusing to run: LISTMONK_TEST_DSN (%q) must point to a database with 'test' in its name", dsn)
 	}
 
 	db, err := sqlx.Connect("postgres", dsn)
@@ -46,6 +54,10 @@ func TestEdgeSync(t *testing.T) {
 
 	q := prepareEdgeQueries(t, db)
 
+	// The sync cycle reads tracking settings from the DB (not koanf), so seed
+	// the setting that the test asserts on.
+	db.MustExec(`UPDATE settings SET value = 'true' WHERE key = 'privacy.individual_tracking'`)
+
 	at := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
 	fake := newFakeEdge("edge-1", []edge.Event{
 		{Seq: 1, Type: "view", At: at, CampUUID: campUUID, SubUUID: subUUID},
@@ -57,7 +69,6 @@ func TestEdgeSync(t *testing.T) {
 	defer srv.Close()
 
 	ko := koanf.New(".")
-	ko.Set("privacy.individual_tracking", true)
 	s := initEdgeSync(edge.New(srv.URL, "secret", time.Second), db, q, ko)
 
 	if err := s.sync(); err != nil {
@@ -103,12 +114,17 @@ func resetSchema(t *testing.T, db *sqlx.DB) {
 	db.MustExec(string(schema))
 }
 
-// prepareEdgeQueries prepares the edge queries from queries/edge.sql.
+// prepareEdgeQueries prepares the edge queries from queries/edge.sql, plus
+// get-settings from queries/misc.sql which the sync cycle reads.
 func prepareEdgeQueries(t *testing.T, db *sqlx.DB) *models.Queries {
 	t.Helper()
-	qMap, err := goyesql.ParseFile("../queries/edge.sql")
-	if err != nil {
-		t.Fatalf("parsing queries: %v", err)
+	qMap := goyesql.Queries{}
+	for _, f := range []string{"../queries/edge.sql", "../queries/misc.sql"} {
+		partial, err := goyesql.ParseFile(f)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", f, err)
+		}
+		maps.Copy(qMap, partial)
 	}
 
 	prep := func(name string) *sqlx.Stmt {
@@ -124,6 +140,7 @@ func prepareEdgeQueries(t *testing.T, db *sqlx.DB) *models.Queries {
 		EdgeInsertClick:  prep("edge-insert-click"),
 		EdgeGetSyncState: prep("edge-get-sync-state"),
 		EdgeSetSyncState: prep("edge-set-sync-state"),
+		GetSettings:      prep("get-settings"),
 	}
 }
 

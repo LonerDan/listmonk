@@ -128,6 +128,8 @@ type Queries struct {
 	EdgeInsertClick  *sqlx.Stmt `query:"edge-insert-click"`
 	EdgeGetSyncState *sqlx.Stmt `query:"edge-get-sync-state"`
 	EdgeSetSyncState *sqlx.Stmt `query:"edge-set-sync-state"`
+	EdgeSetLinksVer  *sqlx.Stmt `query:"edge-set-links-version"`
+	EdgeGetLinks     *sqlx.Stmt `query:"edge-get-links"`
 
 	GetSettings         *sqlx.Stmt `query:"get-settings"`
 	UpdateSettings      *sqlx.Stmt `query:"update-settings"`

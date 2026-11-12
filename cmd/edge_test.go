@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -101,6 +104,35 @@ func TestEdgeSync(t *testing.T) {
 	if views != 1 || clicks != 1 {
 		t.Fatalf("re-delivery created duplicates: %d views, %d clicks", views, clicks)
 	}
+
+	// After the first sync, the edge must hold the link that listmonk knows.
+	if got := fake.links[linkUUID]; got != "https://example.com" {
+		t.Fatalf("expected link pushed to edge, got %q", got)
+	}
+
+	// Simulate the edge losing its data: the version mismatch must trigger a
+	// full re-push of listmonk's links on the next cycle.
+	fake.wipe()
+	if err := s.sync(); err != nil {
+		t.Fatalf("sync after edge data loss: %v", err)
+	}
+	if got := fake.links[linkUUID]; got != "https://example.com" {
+		t.Fatalf("expected link re-pushed to edge after wipe, got %q", got)
+	}
+	var version string
+	db.Get(&version, `SELECT links_version FROM edge_sync_state WHERE edge_id = 'edge-1'`)
+	if version == "" {
+		t.Fatal("expected links_version to be stored after re-sync")
+	}
+
+	// A subsequent cycle must not re-push (version now matches, map untouched).
+	n := len(fake.links)
+	if err := s.sync(); err != nil {
+		t.Fatalf("third sync: %v", err)
+	}
+	if len(fake.links) != n {
+		t.Fatalf("expected link map unchanged, got %d links", len(fake.links))
+	}
 }
 
 func resetSchema(t *testing.T, db *sqlx.DB) {
@@ -140,28 +172,52 @@ func prepareEdgeQueries(t *testing.T, db *sqlx.DB) *models.Queries {
 		EdgeInsertClick:  prep("edge-insert-click"),
 		EdgeGetSyncState: prep("edge-get-sync-state"),
 		EdgeSetSyncState: prep("edge-set-sync-state"),
+		EdgeSetLinksVer:  prep("edge-set-links-version"),
+		EdgeGetLinks:     prep("edge-get-links"),
 		GetSettings:      prep("get-settings"),
 	}
 }
 
-// fakeEdge implements the edge's internal API with a fixed set of events.
+// fakeEdge implements the edge's internal API with a fixed set of events and
+// an in-memory link map, mirroring the SQLite-backed behaviour in the spec.
 type fakeEdge struct {
 	edgeID    string
 	events    []edge.Event
 	redeliver bool
 
-	mu      sync.Mutex
+	mu    sync.Mutex
+	links map[string]string
+
 	ackedTo int64
 }
 
 func newFakeEdge(edgeID string, events []edge.Event) *fakeEdge {
-	return &fakeEdge{edgeID: edgeID, events: events}
+	return &fakeEdge{edgeID: edgeID, events: events, links: map[string]string{}}
 }
 
 func (f *fakeEdge) acked() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.ackedTo
+}
+
+// linksVersion computes an ETag-style fingerprint of the link map: the SHA-256
+// hex digest of the sorted uuid:url lines, as recommended in the spec.
+func (f *fakeEdge) linksVersionLocked() string {
+	lines := make([]string, 0, len(f.links))
+	for uuid, url := range f.links {
+		lines = append(lines, uuid+":"+url)
+	}
+	slices.Sort(lines)
+	h := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(h[:])
+}
+
+// wipe simulates the edge losing its data (wiped SQLite DB).
+func (f *fakeEdge) wipe() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.links = map[string]string{}
 }
 
 func (f *fakeEdge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -177,8 +233,21 @@ func (f *fakeEdge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/internal/v1/config":
 		w.WriteHeader(http.StatusNoContent)
 
+	case "/internal/v1/links":
+		var body struct {
+			Links []edge.Link `json:"links"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, l := range body.Links {
+			f.links[l.UUID] = l.URL
+		}
+		json.NewEncoder(w).Encode(map[string]string{"links_version": f.linksVersionLocked()})
+
 	case "/internal/v1/health":
-		json.NewEncoder(w).Encode(edge.Health{EdgeID: f.edgeID})
+		json.NewEncoder(w).Encode(edge.Health{EdgeID: f.edgeID, LinksVersion: f.linksVersionLocked()})
 
 	case "/internal/v1/events":
 		var after int64

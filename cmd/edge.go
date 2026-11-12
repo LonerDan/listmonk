@@ -19,6 +19,7 @@ import (
 
 const (
 	edgeBatchSize    = 500
+	edgeLinkBatch    = 500
 	edgePollInterval = 30 * time.Second
 	edgeHTTPTimeout  = 10 * time.Second
 )
@@ -86,6 +87,12 @@ func (e *edgeSync) Run(ctx context.Context) {
 	}
 }
 
+// edgeSyncState is the sync cursor row for one edge.
+type edgeSyncState struct {
+	LastSeq      int64  `db:"last_seq"`
+	LinksVersion string `db:"links_version"`
+}
+
 // checkEdgeID halts syncing if the edge's ID has changed since the last cycle.
 // A changed edge ID means events may be re-read from seq 0, which is never
 // something that should happen silently.
@@ -103,6 +110,61 @@ func (e *edgeSync) checkEdgeID(id string) error {
 			"duplicating events from seq 0. Restore the previous edge ID or reset the "+
 			"edge_sync_state row for the new edge manually", e.lastEdgeID, id)
 	}
+	return nil
+}
+
+// syncLinks re-pushes every link known to listmonk to the edge and records the
+// resulting links_version fingerprint. This reconciles the edge after data loss
+// (its map was wiped) or brings a new edge up to date.
+func (e *edgeSync) syncLinks(edgeID string) error {
+	lo.Printf("tracking edge link map out of sync (edge_id=%s), re-pushing all links", edgeID)
+
+	rows, err := e.q.EdgeGetLinks.Queryx()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	// Push in batches; the edge returns the fingerprint of its map after each
+	// batch, and the last one is the version of the fully applied update.
+	batch := make([]edge.Link, 0, edgeLinkBatch)
+	var version string
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		v, err := e.client.PutLinks(batch)
+		if err != nil {
+			return err
+		}
+		version = v
+		batch = batch[:0]
+		return nil
+	}
+
+	for rows.Next() {
+		var uuid, url string
+		if err := rows.Scan(&uuid, &url); err != nil {
+			return err
+		}
+		batch = append(batch, edge.Link{UUID: uuid, URL: url})
+		if len(batch) >= edgeLinkBatch {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := flush(); err != nil {
+		return err
+	}
+
+	if _, err := e.q.EdgeSetLinksVer.Exec(edgeID, version); err != nil {
+		return fmt.Errorf("saving links version: %w", err)
+	}
+	lo.Printf("tracking edge link map synced (%s)", edgeID)
 	return nil
 }
 
@@ -137,11 +199,21 @@ func (e *edgeSync) sync() error {
 		return err
 	}
 
-	var last int64
-	if err := e.q.EdgeGetSyncState.Get(&last, h.EdgeID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var state edgeSyncState
+	if err := e.q.EdgeGetSyncState.Get(&state, h.EdgeID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("reading sync state: %w", err)
 	}
 
+	// If the edge's link map fingerprint doesn't match what we last synced to it
+	// (eg: its data store was wiped), re-push all known links before its version
+	// check can register clicks against missing links.
+	if h.LinksVersion != state.LinksVersion {
+		if err := e.syncLinks(h.EdgeID); err != nil {
+			return fmt.Errorf("syncing links to edge: %w", err)
+		}
+	}
+
+	last := state.LastSeq
 	for {
 		batch, err := e.client.PullEvents(last, edgeBatchSize)
 		if err != nil {

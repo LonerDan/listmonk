@@ -24,14 +24,41 @@ The edge never connects to listmonk.
 
 ### Requirements
 
+- **Storage: SQLite.** The edge stores its data in a SQLite database. SQLite is
+  the reference store because the edge is a single self-contained process: the
+  database survives restarts without losing events or links, and needs no
+  separate infrastructure. Recommended pragmas: `journal_mode=WAL`,
+  `synchronous=NORMAL`, `busy_timeout`. Suggested schema:
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS links (
+      uuid TEXT PRIMARY KEY,
+      url  TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS events (
+      seq       INTEGER PRIMARY KEY, -- monotonic counter, persisted across restarts
+      type      TEXT NOT NULL,       -- 'view' or 'click'
+      at        TEXT NOT NULL,       -- RFC 3339
+      camp_uuid TEXT NOT NULL,
+      sub_uuid  TEXT NOT NULL DEFAULT '',
+      link_uuid TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY, -- 'edge_id', 'links_version', ...
+      value TEXT NOT NULL
+  );
+  ```
+
 - Two listeners: a public one (any address) and an internal one that is bound
   only to the VPN interface or a VPN-only address. The internal listener must
   not be reachable from the internet.
 - The public listener serves only the two public routes below.
 - The internal listener serves only the `/internal/v1/*` routes below.
-- Persistent storage (e.g. SQLite, or any embedded DB) for the link map, the
-  event queue, and the edge ID. The edge must survive restarts without losing
-  events or links.
+- Persistent storage (SQLite, see above) for the link map, the event queue, the
+  edge ID, and the `links_version` fingerprint. The edge must survive restarts
+  without losing events or links.
 
 ## Public routes
 
@@ -97,7 +124,8 @@ Response `200 OK`:
   "edge_id": "edge-eu-1",
   "links": 1234,
   "queued_events": 56,
-  "last_seq": 98765
+  "last_seq": 98765,
+  "links_version": "9f2c1a…"
 }
 ```
 
@@ -107,6 +135,13 @@ Response `200 OK`:
   so it must not be changed casually.
 - `links`, `queued_events`, `last_seq` (integers, optional): informational.
   listmonk does not depend on them.
+- `links_version` (string, required): an opaque, ETag-style fingerprint of the
+  link map (see [`PUT /internal/v1/links`](#put-internalv1links)). listmonk
+  compares it to the version it last synced and re-pushes all links when they
+  differ. It must be persisted in the SQLite `meta` table and recomputed on
+  every change to the link map. A stable recipe: SHA-256 hex digest of the
+  sorted `uuid:url` lines of the link map (the empty map has a well-defined,
+  non-empty digest).
 
 ### `PUT /internal/v1/config`
 
@@ -154,7 +189,18 @@ Behaviour:
 - Upsert by `uuid`. Re-sending a known link with the same URL is harmless.
   Re-sending with a different URL replaces the stored URL.
 - Persist before responding, so a restart does not lose links.
-- Response: `204 No Content`.
+- Recompute and persist `links_version` after applying the batch.
+- Response: `200 OK` with the fingerprint of the link map after the update:
+
+  ```json
+  { "links_version": "9f2c1a…" }
+  ```
+
+  listmonk stores this value and compares it against `links_version` from
+  `GET /health` on every sync cycle. If they differ — for example, because the
+  edge's SQLite database was wiped or restored from an old backup — listmonk
+  re-pushes every link it knows. This is what makes edge data loss self-healing
+  instead of requiring a listmonk restart.
 
 ### `GET /internal/v1/events?after={seq}&limit={n}`
 
@@ -255,19 +301,21 @@ The edge does not need to validate the UUIDs.
 
 ## Expected sequence per sync cycle
 
-listmonk runs this every `poll_interval`:
-
 1. `PUT /internal/v1/config`
-2. `GET /internal/v1/health` (read `edge_id`)
-3. Loop:
+2. `GET /internal/v1/health` (read `edge_id` and `links_version`)
+3. If `links_version` differs from the last synced version, re-push all known
+   links with `PUT /internal/v1/links` (batched) and store the returned version.
+4. Loop:
    - `GET /internal/v1/events?after=<cursor>&limit=500`
    - If empty, stop.
    - Store the events and advance the cursor, all in one transaction.
    - `POST /internal/v1/events/ack` with `up_to` set to the new cursor.
    - If fewer than 500 events were returned, stop.
 
-Links are pushed separately, when listmonk first renders a tracked link:
-`PUT /internal/v1/links`. This happens at render time, not on the cycle above.
+New links are additionally pushed individually, when listmonk first renders a
+tracked link: `PUT /internal/v1/links`. This happens at render time, not on
+the cycle above. (listmonk does not store the version from these individual
+pushes; the next health check confirms convergence.)
 
 ## Failure behaviour on the listmonk side
 
@@ -277,13 +325,14 @@ Links are pushed separately, when listmonk first renders a tracked link:
 - If a sync cycle fails, listmonk logs the error and retries on the next cycle.
   Events are not lost because they stay on the edge until acked.
 
-## Known limitation
+## Link map recovery
 
-If the edge loses its link map (for example, its database is wiped), listmonk
-does not re-push links until it restarts. Links that were already rendered into
-sent emails then return 404 on click until listmonk restarts and renders them again.
-A future listmonk change could re-push known links from the database, but that
-is not part of this spec.
+If the edge loses its link map (its SQLite database is wiped or restored from
+a stale backup), the mismatch between the edge's `links_version` and the
+version listmonk last synced is detected on the next sync cycle, and listmonk
+re-pushes every link it knows. Tracking resumes without operator intervention
+and without a listmonk restart. Clicks that arrived while the map was empty
+still return 404 and are lost — this window is bounded by `poll_interval`.
 
 ## Configuration reference (listmonk side)
 

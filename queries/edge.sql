@@ -18,8 +18,15 @@ LEFT JOIN subscribers s ON s.uuid = CASE WHEN NULLIF($3, '') ~ '^[0-9a-fA-F]{8}-
 WHERE l.uuid = CASE WHEN $1 ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' THEN $1::UUID END;
 
 -- name: edge-get-sync-state
-SELECT last_seq FROM edge_sync_state WHERE edge_id = $1;
+SELECT last_seq, links_version FROM edge_sync_state WHERE edge_id = $1;
 
 -- name: edge-set-sync-state
-INSERT INTO edge_sync_state (edge_id, last_seq, updated_at) VALUES ($1, $2, NOW())
+INSERT INTO edge_sync_state (edge_id, last_seq, links_version, updated_at) VALUES ($1, $2, '', NOW())
 ON CONFLICT (edge_id) DO UPDATE SET last_seq = EXCLUDED.last_seq, updated_at = NOW();
+
+-- name: edge-set-links-version
+INSERT INTO edge_sync_state (edge_id, last_seq, links_version, updated_at) VALUES ($1, 0, $2, NOW())
+ON CONFLICT (edge_id) DO UPDATE SET links_version = EXCLUDED.links_version, updated_at = NOW();
+
+-- name: edge-get-links
+SELECT uuid, url FROM links;

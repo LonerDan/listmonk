@@ -42,6 +42,18 @@ type Health struct {
 	Links        int64  `json:"links"`
 	QueuedEvents int64  `json:"queued_events"`
 	LastSeq      int64  `json:"last_seq"`
+	LinksVersion string `json:"links_version"`
+}
+
+// Link is a tracked link to register on the edge.
+type Link struct {
+	UUID string `json:"uuid"`
+	URL  string `json:"url"`
+}
+
+// linksVersionResp is the response of PUT /internal/v1/links.
+type linksVersionResp struct {
+	LinksVersion string `json:"links_version"`
 }
 
 // Client talks to a tracking edge's internal API.
@@ -60,10 +72,24 @@ func New(baseURL, token string, timeout time.Duration) *Client {
 	}
 }
 
-// PutLink registers a tracked link (UUID to URL) on the edge.
+// PutLink registers a single tracked link (UUID to URL) on the edge.
 func (c *Client) PutLink(uuid, url string) error {
-	body := map[string]any{"links": []map[string]string{{"uuid": uuid, "url": url}}}
-	return c.do(http.MethodPut, "/internal/v1/links", body, nil)
+	_, err := c.PutLinks([]Link{{UUID: uuid, URL: url}})
+	return err
+}
+
+// PutLinks registers tracked links on the edge and returns the new
+// links_version fingerprint of the edge's link map.
+func (c *Client) PutLinks(links []Link) (string, error) {
+	if len(links) == 0 {
+		return "", nil
+	}
+
+	var out linksVersionResp
+	if err := c.do(http.MethodPut, "/internal/v1/links", map[string]any{"links": links}, &out); err != nil {
+		return "", err
+	}
+	return out.LinksVersion, nil
 }
 
 // PutConfig pushes the tracking behaviour to the edge.
